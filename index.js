@@ -1,7 +1,6 @@
-require("dotenv").config(); // Load environment variables
-const mysql = require("mysql2/promise");
 const fs = require("fs").promises;
 const path = require("path");
+require("dotenv").config();
 
 class DatabaseMigrator {
   constructor() {
@@ -26,11 +25,18 @@ class DatabaseMigrator {
         varName === "PORT" ? parseInt(value, 10) : value;
     });
 
-    return config;
+    return {
+      ...config,
+      connectionLimit: 10,
+      connectTimeout: 10000,
+      waitForConnections: true,
+      queueLimit: 0,
+    };
   }
 
   createLogger() {
     const logDir = path.join(__dirname, "logs");
+
     // Ensure logs directory exists
     fs.mkdir(logDir, { recursive: true }).catch(console.error);
 
@@ -53,6 +59,32 @@ class DatabaseMigrator {
     };
   }
 
+  async createPoolConnection(config) {
+    const mysql = require("mysql2/promise");
+    return mysql.createPool(config);
+  }
+
+  async getForeignKeyDependencies(connection, tableName) {
+    const database = this.sourceConfig.database;
+    const [foreignKeys] = await connection.execute(
+      `
+        SELECT 
+            TABLE_NAME, 
+            COLUMN_NAME, 
+            REFERENCED_TABLE_NAME, 
+            REFERENCED_COLUMN_NAME
+        FROM 
+            INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+        WHERE 
+            TABLE_SCHEMA = ? 
+            AND REFERENCED_TABLE_NAME = ?
+      `,
+      [database, tableName]
+    );
+
+    return foreignKeys;
+  }
+
   async getTableSchema(connection, tableName) {
     try {
       const [rows] = await connection.execute(`DESCRIBE ${tableName}`);
@@ -71,6 +103,14 @@ class DatabaseMigrator {
       );
       throw error;
     }
+  }
+
+  async disableForeignKeyChecks(connection) {
+    await connection.execute("SET FOREIGN_KEY_CHECKS = 0");
+  }
+
+  async enableForeignKeyChecks(connection) {
+    await connection.execute("SET FOREIGN_KEY_CHECKS = 1");
   }
 
   async backupTable(connection, tableName) {
@@ -98,11 +138,52 @@ class DatabaseMigrator {
     }
   }
 
+  async getMigrationOrder(connection, tables) {
+    const dependencyGraph = new Map();
+    const visited = new Set();
+    const order = [];
+
+    for (const table of tables) {
+      dependencyGraph.set(table, new Set());
+    }
+
+    for (const table of tables) {
+      const foreignKeys = await this.getForeignKeyDependencies(
+        connection,
+        table
+      );
+
+      for (const fk of foreignKeys) {
+        if (tables.includes(fk.TABLE_NAME)) {
+          dependencyGraph.get(fk.TABLE_NAME).add(table);
+        }
+      }
+    }
+
+    function visit(table) {
+      if (visited.has(table)) return;
+      visited.add(table);
+
+      for (const dep of dependencyGraph.get(table)) {
+        visit(dep);
+      }
+
+      order.unshift(table);
+    }
+
+    for (const table of tables) {
+      visit(table);
+    }
+
+    return order;
+  }
+
   async migrateTable(tableName, options = {}) {
     const {
       truncateTarget = true,
       chunkSize = 1000,
       ignoreColumns = [],
+      foreignKeyStrategy = "disable",
     } = options;
 
     const result = {
@@ -115,10 +196,14 @@ class DatabaseMigrator {
     let sourceConn, targetConn;
 
     try {
-      // Establish connections
-      sourceConn = await mysql.createConnection(this.sourceConfig);
-      targetConn = await mysql.createConnection(this.targetConfig);
+      sourceConn = await this.createPoolConnection(this.sourceConfig);
+      targetConn = await this.createPoolConnection(this.targetConfig);
+
       console.log(sourceConn);
+
+      if (foreignKeyStrategy === "disable") {
+        await this.disableForeignKeyChecks(targetConn);
+      }
 
       const sourceSchema = await this.getTableSchema(sourceConn, tableName);
       const targetSchema = await this.getTableSchema(targetConn, tableName);
@@ -140,18 +225,17 @@ class DatabaseMigrator {
       const insertColumns = commonColumns;
       const insertPlaceholders = insertColumns.map(() => "?").join(", ");
       const insertQuery = `
-                INSERT INTO ${tableName} 
-                (${insertColumns.join(", ")}) 
-                VALUES (${insertPlaceholders})
-            `;
+        INSERT INTO ${tableName} 
+        (${insertColumns.join(", ")}) 
+        VALUES (${insertPlaceholders})
+      `;
 
-      // Fetch and migrate data in chunks
       let offset = 0;
       while (true) {
         const [rows] = await sourceConn.execute(
           `SELECT ${insertColumns.join(", ")} 
-                     FROM ${tableName} 
-                     LIMIT ?, ?`,
+           FROM ${tableName} 
+           LIMIT ?, ?`,
           [offset, chunkSize]
         );
 
@@ -185,7 +269,15 @@ class DatabaseMigrator {
         `Migration failed for table ${tableName}: ${error.message}`
       );
     } finally {
-      // Close connections
+      if (targetConn && foreignKeyStrategy === "disable") {
+        try {
+          await this.enableForeignKeyChecks(targetConn);
+        } catch (err) {
+          await this.logger.error(
+            `Error re-enabling foreign key checks: ${err.message}`
+          );
+        }
+      }
       if (sourceConn) await sourceConn.end();
       if (targetConn) await targetConn.end();
     }
@@ -194,21 +286,21 @@ class DatabaseMigrator {
   }
 
   async migrateTables(tables, options = {}) {
-    const results = {};
+    const sourceConn = await this.createPoolConnection(this.sourceConfig);
 
-    for (const table of tables) {
-      try {
+    try {
+      const migrationOrder = await this.getMigrationOrder(sourceConn, tables);
+
+      const results = {};
+
+      for (const table of migrationOrder) {
         results[table] = await this.migrateTable(table, options);
-      } catch (error) {
-        results[table] = {
-          table,
-          success: false,
-          errors: [error.message],
-        };
       }
-    }
 
-    return results;
+      return results;
+    } finally {
+      await sourceConn.end();
+    }
   }
 }
 
@@ -226,9 +318,12 @@ async function runMigration() {
       ignoreColumns: process.env.IGNORE_COLUMNS
         ? process.env.IGNORE_COLUMNS.split(",").map((c) => c.trim())
         : [],
+      foreignKeyStrategy: process.env.FOREIGN_KEY_STRATEGY || "disable",
     });
 
     console.log("Migration Results:", JSON.stringify(results, null, 2));
+
+    process.exit(Object.values(results).every((r) => r.success) ? 0 : 1);
   } catch (error) {
     console.error("Migration failed:", error);
     process.exit(1);
